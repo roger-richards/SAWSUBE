@@ -1,25 +1,26 @@
-# ---- frontend build (Debian-based to avoid Alpine build issues) ----
+# ---- frontend build (Debian-based to avoid Alpine/musl issues) ----
 FROM node:20-bullseye-slim AS frontend
 WORKDIR /fe
 
-# Install minimal build deps for native modules (only when needed)
+# Minimal build tools for native modules (node-gyp)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     make \
     g++ \
   && rm -rf /var/lib/apt/lists/*
 
-COPY frontend/package.json ./frontend/package.json
-# Copy lockfile if present to enable npm ci
-COPY frontend/package-lock.json ./frontend/package-lock.json
+# Copy package files into the working directory (important: copy to . not ./frontend/)
+COPY frontend/package.json ./package.json
+COPY frontend/package-lock.json ./package-lock.json
 
 # Use npm ci when lockfile exists, otherwise fall back to npm install
-RUN if [ -f ./frontend/package-lock.json ]; then \
+RUN if [ -f ./package-lock.json ]; then \
       npm ci --no-audit --progress=false; \
     else \
       npm install --no-audit --progress=false; \
     fi
 
+# Copy the rest of the frontend source and build
 COPY frontend/ .
 RUN npm run build
 
