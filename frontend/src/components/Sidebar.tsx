@@ -12,6 +12,7 @@ const links = [
   ['/schedules', 'Schedules'],
   ['/settings', 'Settings'],
   ['/tizenbrew', 'TizenBrew'],
+  ['/debloat', 'Debloat'],
 ] as const
 
 export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {

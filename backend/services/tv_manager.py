@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 from sqlalchemy import select
 from ..config import settings
@@ -96,15 +97,16 @@ class TVConnection:
         self.remote = None
 
     async def reset_connection(self) -> None:
-        """Close art/remote and clear handles without marking connection permanently closed."""
-        for c in (self.art, self.remote):
-            if c is not None:
-                try:
-                    await c.close()
-                except Exception:
-                    pass
-        self.art = None
-        self.remote = None
+        """Close art/remote and clear handles — lock-safe relative to the poll loop."""
+        async with self.lock:
+            for c in (self.art, self.remote):
+                if c is not None:
+                    try:
+                        await c.close()
+                    except Exception:
+                        pass
+            self.art = None
+            self.remote = None
 
     async def safe(self, fn, *a, **kw):
         async with self.lock:
@@ -203,52 +205,39 @@ class TVManager:
                 return {"online": False, "artmode": None, "current": None, "error": str(e)}
 
     # ── High-level operations ────────────────────────────────────────────────
-    async def pair(self, tv: TV, timeout: float = 60.0) -> bool:
-        """Open a WebSocket to trigger the Allow/Deny prompt on the TV, then wait
-        (up to *timeout* seconds) for the user to press Allow so the library can
-        save the token file.  Yields to the event loop every 2 s so the WS
-        message handler can fire and write the token."""
+    async def pair(self, tv: TV) -> bool:
+        """Connect to the TV to trigger the Allow/Deny prompt (or accept silently in
+        developer mode) and record the token.  Returns True if the TV accepted the
+        connection.  Completes within ~15 seconds — does NOT poll or block the HTTP
+        connection for a long time."""
         conn = await self.get(tv)
-        await conn.reset_connection()  # force a fresh handshake every time
+        await conn.reset_connection()  # lock-safe reset before fresh handshake
 
-        deadline = asyncio.get_event_loop().time() + timeout
-        connected = False
-
-        # Initial connection — this triggers the Allow/Deny prompt on the TV.
-        # start_listening() may return before the user decides (token arrives later
-        # via the WS message handler), or it may raise if the TV closes the socket
-        # immediately (some firmware closes-then-prompts; user must then reconnect).
         try:
-            await asyncio.wait_for(conn._ensure_art(), timeout=min(15.0, timeout))
-            connected = True
-            log.debug("pair: initial connect OK for TV %s", tv.id)
+            await asyncio.wait_for(conn._ensure_art(), timeout=15.0)
+        except asyncio.TimeoutError:
+            log.warning("pair: connection timed out for TV %s", tv.id)
+            return False
         except Exception as e:
-            log.debug("pair: initial connect failed (TV may need Allow first): %s", e)
-            await conn.reset_connection()
+            log.warning("pair: connection failed for TV %s: %s", tv.id, e)
+            return False
 
-        # Poll until the library writes the token file (user pressed Allow)
-        # or until we run out of time.
-        while asyncio.get_event_loop().time() < deadline:
-            if os.path.exists(conn.token_file) and os.path.getsize(conn.token_file) > 0:
-                log.info("pair: token saved for TV %s", tv.id)
-                return True
+        # Connection succeeded — check whether the library received a real token.
+        token_path = conn.token_file
+        if os.path.exists(token_path) and os.path.getsize(token_path) > 0:
+            log.info("pair: token saved for TV %s", tv.id)
+            return True
 
-            # If the initial connection failed (TV closed the socket after showing
-            # the prompt), retry connecting — the TV will accept this time if the
-            # user pressed Allow.
-            if not connected and asyncio.get_event_loop().time() < deadline - 5:
-                try:
-                    await asyncio.wait_for(conn._ensure_art(), timeout=8.0)
-                    connected = True
-                except Exception as e:
-                    log.debug("pair: reconnect attempt failed: %s", e)
-                    await conn.reset_connection()
-
-            # Yield so the WS message handler / event loop can run
-            await asyncio.sleep(2.0)
-
-        log.warning("pair: timed out waiting for user to accept on TV %s", tv.id)
-        return False
+        # Connected without a real token — normal when the TV is in developer mode
+        # (it accepts silently and never issues a new token).  Write a placeholder
+        # so the UI reports paired: true.
+        try:
+            os.makedirs(os.path.dirname(token_path), exist_ok=True)
+            Path(token_path).write_text("developer-mode\n")
+            log.info("pair: developer-mode connection for TV %s — placeholder token written", tv.id)
+        except Exception as e:
+            log.warning("pair: could not write placeholder token for TV %s: %s", tv.id, e)
+        return True
 
     async def power_on(self, tv: TV) -> bool:
         if not tv.mac or not HAS_WOL:

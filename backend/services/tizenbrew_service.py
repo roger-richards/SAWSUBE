@@ -70,8 +70,8 @@ CURATED_APPS: list[dict[str, Any]] = [
         "name": "Radarrzen",
         "description": "Movie collection manager for your Samsung TV. Connects to your existing Radarr instance — browse your library, search for movies, and monitor downloads from your couch.",
         "icon_url": "https://raw.githubusercontent.com/Radarr/Radarr/develop/Logo/256.png",
-        "source_type": "github",
-        "source": "WB2024/radarrzen",
+        "source_type": "local_build",
+        "source": "local:radarrzen",
         "category": "Media",
         "inject_config": {
             "storage_key": "radarrzen-config",
@@ -84,8 +84,8 @@ CURATED_APPS: list[dict[str, Any]] = [
         "name": "Sonarrzen",
         "description": "TV-show collection manager for your Samsung TV. Connects to your existing Sonarr instance — browse your library, search for shows, manage seasons & episodes, and monitor downloads from your couch.",
         "icon_url": "https://raw.githubusercontent.com/Sonarr/Sonarr/develop/Logo/256.png",
-        "source_type": "github",
-        "source": "WB2024/sonarrzen",
+        "source_type": "local_build",
+        "source": "local:sonarrzen",
         "category": "Media",
         "inject_config": {
             "storage_key": "sonarrzen-config",
@@ -101,6 +101,24 @@ CURATED_APPS: list[dict[str, Any]] = [
         "source_type": "local_build",
         "source": "local:fieshzen",
         "category": "Music",
+    },
+    {
+        "id": "castafiorezen",
+        "name": "Castafiorezen",
+        "description": "Native Tizen music player for Navidrome / Subsonic — built from scratch in ES5 for Samsung TVs. Lightweight, remote-friendly, AVPlay-backed audio.",
+        "icon_url": "https://raw.githubusercontent.com/jeffvli/feishin/main/resources/icons/icon.png",
+        "source_type": "local_build",
+        "source": "local:castafiorezen",
+        "category": "Music",
+        "inject_config": {
+            "storage_key": "cz-server",
+            "config_file": "js/sawsube-config.js",
+            "fields": {
+                "serverUrl": "NAVIDROME_URL",
+                "username": "NAVIDROME_USERNAME",
+                "password": "NAVIDROME_PASSWORD",
+            },
+        },
     },
 ]
 
@@ -158,16 +176,15 @@ class TizenBrewService:
         sdb_path: str | None = None
         tizen_path: str | None = None
 
+        # Explicit .env overrides take priority (must point to the file)
         if sdb_override and Path(sdb_override).is_file():
             sdb_path = sdb_override
         if tizen_override and Path(tizen_override).is_file():
             tizen_path = tizen_override
 
-        if not sdb_path:
-            sdb_path = shutil.which("sdb")
-        if not tizen_path:
-            tizen_path = shutil.which("tizen")
-
+        # Well-known installation directories (checked before shutil.which so that
+        # tizen-studio is preferred over whatever binary happens to be on PATH,
+        # e.g. tizen-extension-platform which has no user profiles)
         candidate_roots: list[Path] = []
         if platform.system() == "Windows":
             candidate_roots += [Path("C:/tizen-studio"), Path("C:/tizen-studio-data")]
@@ -189,11 +206,18 @@ class TizenBrewService:
                 if p.is_file():
                     tizen_path = str(p)
 
+        # Last resort: whatever is on PATH
+        if not sdb_path:
+            sdb_path = shutil.which("sdb")
+        if not tizen_path:
+            tizen_path = shutil.which("tizen")
+
         return {
             "sdb_path": sdb_path,
             "tizen_path": tizen_path,
             "found": bool(sdb_path and tizen_path),
         }
+
 
     # ── TV info via port 8001 ─────────────────────────────────────────────
     async def fetch_tv_api_info(self, tv_ip: str) -> dict[str, Any]:
@@ -365,6 +389,21 @@ class TizenBrewService:
                 ips.append(parts[0])
         return ips
 
+    async def sdb_uninstall(self, sdb_path: str, tv_ip: str, app_id: str) -> dict[str, Any]:
+        """Uninstall an app by package ID using sdb shell pkgcmd.
+
+        Samsung TVs use pkgcmd -u -n <app_id> (not -d) for widget packages.
+        Connecting is done first to ensure the daemon has the device registered.
+        """
+        await self.run_command([sdb_path, "connect", tv_ip], timeout=30.0)
+        res = await self.run_command(
+            [sdb_path, "shell", "0", "pkgcmd", "-u", "-n", app_id, "-q"],
+            timeout=60.0,
+        )
+        out = (res.get("stdout") or "").lower()
+        success = res["returncode"] == 0 and "fail" not in out
+        return {"success": success, "output": res.get("stdout", ""), "returncode": res["returncode"]}
+
     # ── Certificates ───────────────────────────────────────────────────────
     async def list_certificate_profiles(self, tizen_path: str) -> list[str]:
         res = await self.run_command([tizen_path, "security-profiles", "list"], timeout=15.0)
@@ -413,64 +452,96 @@ class TizenBrewService:
 
         await _broadcast("Creating developer certificate…", 5)
 
-        # Use only flags that exist in all Tizen Studio CLI versions.
-        # -a  alias / output file name (required in older SDKs)
-        # -p  password (always required)
-        # -o  organization
-        # -s  state
-        # -u  org unit (we reuse as city; it's optional)
-        cert_cmd = [
-            tizen_path, "certificate",
-            "-a", profile_name,
-            "-p", password,
-            "-o", org,
-            "-s", state,
-            "-u", city,
-        ]
+        # The tizen CLI always names the output file "author.p12" (regardless of the
+        # -a alias flag, which sets the display name only).  The file goes to:
+        #   ~/tizen-studio-data/keystore/author/author.p12
+        # If it already exists the CLI aborts with "Already exist the specified filename".
+        # Detect that upfront and skip certificate creation — reuse the existing file.
+        keystore_dir = Path.home() / "tizen-studio-data" / "keystore" / "author"
+        keystore_p12 = keystore_dir / "author.p12"
+        already_exists = keystore_p12.exists()
 
-        await _broadcast("Running tizen certificate…", 20)
-        res = await self.run_command(
-            cert_cmd, timeout=60.0, tv_id=tv_id, step="certificate", progress=50,
-        )
+        # Also check if the named profile is already registered in profiles.xml so we
+        # can skip `security-profiles add` (which also fails on duplicates).
+        profiles_xml = Path.home() / "tizen-studio-data" / "profile" / "profiles.xml"
+        profile_already_registered = False
+        if profiles_xml.exists():
+            try:
+                import xml.etree.ElementTree as ET
+                tree = ET.parse(str(profiles_xml))
+                profile_already_registered = any(
+                    p.get("name") == profile_name
+                    for p in tree.getroot().findall("profile")
+                )
+            except Exception:
+                pass  # if we can't parse, attempt registration anyway
 
-        # Detect failure by help-text in output (tizen prints help on bad args)
-        out_lower = res["stdout"].lower()
-        help_printed = (
-            "specify the user" in out_lower
-            or "usage:" in out_lower
-            or "--help" in out_lower
-            or ("returncode" in res and res["returncode"] != 0 and "-p (--password)" in out_lower)
-        )
-        if help_printed and res["returncode"] != 0:
-            # Try with only the truly required flag to isolate the issue
-            await _broadcast("Retrying with minimal flags…", 30)
-            cert_cmd_min = [tizen_path, "certificate", "-p", password]
+        if already_exists:
+            await _broadcast(f"Reusing existing certificate at {keystore_p12}…", 40)
+            res = {"returncode": 0, "stdout": "", "stderr": ""}
+        else:
+            cert_cmd = [
+                tizen_path, "certificate",
+                "-a", profile_name,
+                "-p", password,
+                "-o", org,
+                "-s", state,
+                "-u", city,
+            ]
+
+            await _broadcast("Running tizen certificate…", 20)
             res = await self.run_command(
-                cert_cmd_min, timeout=60.0, tv_id=tv_id, step="certificate", progress=55,
+                cert_cmd, timeout=60.0, tv_id=tv_id, step="certificate", progress=50,
             )
+
+            # "Already exist" in stdout means the CLI created the file on a previous
+            # run but reported failure — treat as success if the file now exists.
+            combined = (res.get("stdout") or "") + (res.get("stderr") or "")
+            if "already exist" in combined.lower() and keystore_p12.exists():
+                res = {"returncode": 0, "stdout": combined, "stderr": ""}
+            elif res["returncode"] != 0:
+                # Detect bad-flag failures (tizen prints help on unknown args)
+                out_lower = combined.lower()
+                help_printed = (
+                    "specify the user" in out_lower
+                    or "usage:" in out_lower
+                    or "--help" in out_lower
+                    or "-p (--password)" in out_lower
+                )
+                if help_printed:
+                    await _broadcast("Retrying with minimal flags…", 30)
+                    cert_cmd_min = [tizen_path, "certificate", "-p", password]
+                    res = await self.run_command(
+                        cert_cmd_min, timeout=60.0, tv_id=tv_id, step="certificate", progress=55,
+                    )
 
         success = res["returncode"] == 0
 
         if success:
             await _broadcast("Registering security profile…", 80)
-            # The p12 is placed in ~/SamsungCertificate/<alias>/ by Tizen Studio CLI.
-            # Try that path; fall back to download_dir.
+            # The p12 is always author.p12 for standard (non-Samsung-extension) certs.
+            # Fall back to named-alias paths used by the Samsung Certificate Extension.
             home = Path.home()
             samsung_cert_dir = home / "SamsungCertificate" / profile_name
             p12_candidates = [
+                keystore_p12,  # ~/tizen-studio-data/keystore/author/author.p12 (standard)
+                keystore_dir / f"{profile_name}.p12",
                 samsung_cert_dir / f"{profile_name}.p12",
                 self.download_dir / f"{profile_name}.p12",
                 Path.cwd() / f"{profile_name}.p12",
             ]
             p12_path = next((p for p in p12_candidates if p.exists()), p12_candidates[0])
 
-            profile_cmd = [
-                tizen_path, "security-profiles", "add",
-                "-n", profile_name,
-                "-a", str(p12_path),
-                "-p", password,
-            ]
-            await self.run_command(profile_cmd, timeout=30.0, tv_id=tv_id, step="certificate", progress=90)
+            if profile_already_registered:
+                await _broadcast(f"Profile '{profile_name}' already registered — skipping", 90)
+            else:
+                profile_cmd = [
+                    tizen_path, "security-profiles", "add",
+                    "-n", profile_name,
+                    "-a", str(p12_path),
+                    "-p", password,
+                ]
+                await self.run_command(profile_cmd, timeout=30.0, tv_id=tv_id, step="certificate", progress=90)
             await _broadcast("✓ Certificate + profile created", 100)
             await ws_manager.broadcast({
                 "type": "tizenbrew_install_progress", "tv_id": tv_id or 0,
@@ -744,6 +815,72 @@ class TizenBrewService:
 
         success = res["returncode"] == 0 and "fail" not in res["stdout"].lower() and \
                   "there is no" not in res["stdout"].lower()
+
+        # Detect "Author certificate not match" (error 118/-11): the app is already
+        # installed on the TV signed with a different cert.  Auto-uninstall and retry once.
+        cert_mismatch = "author certificate not match" in res["stdout"].lower() or \
+                        "install failed[118" in res["stdout"].lower()
+        if not success and cert_mismatch:
+            # Extract app_id from the install output: "app_id[<id>]"
+            import re as _re
+            m = _re.search(r"app_id\[([^\]]+)\]", res["stdout"])
+            app_id = m.group(1) if m else None
+            if app_id:
+                await ws_manager.broadcast({
+                    "type": "tizenbrew_install_progress", "tv_id": tv_id,
+                    "step": "installing", "progress": 60,
+                    "message": f"Certificate mismatch — uninstalling old version ({app_id}) and retrying…",
+                })
+                log.info("install_wgt: cert mismatch, uninstalling %s from %s", app_id, tv_ip)
+                await self.sdb_uninstall(sdb_path, tv_ip, app_id)
+                await asyncio.sleep(3)  # give TV time to finish uninstall
+
+                # Retry the install
+                shell_cmd2 = f"{sdb_path} connect {tv_ip} && {tizen_path} install -n {wgt_path}"
+                await ws_manager.broadcast({
+                    "type": "tizenbrew_install_progress", "tv_id": tv_id,
+                    "step": "installing", "progress": 75,
+                    "message": "Retrying install after uninstall…",
+                })
+                proc2 = await asyncio.create_subprocess_shell(
+                    shell_cmd2,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                out_lines2: list[str] = []
+
+                async def _read_shell2() -> None:
+                    assert proc2.stdout
+                    while True:
+                        line = await proc2.stdout.readline()
+                        if not line:
+                            break
+                        text = line.decode(errors="replace").rstrip()
+                        if not text:
+                            continue
+                        out_lines2.append(text)
+                        log.info("tizenbrew install retry: %s", text)
+                        await ws_manager.broadcast({
+                            "type": "tizenbrew_install_progress",
+                            "tv_id": tv_id, "step": "installing",
+                            "message": text, "progress": 85,
+                        })
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(_read_shell2(), proc2.wait()), timeout=300.0,
+                    )
+                except asyncio.TimeoutError:
+                    try:
+                        proc2.kill()
+                    except Exception:
+                        pass
+                stdout2 = "\n".join(out_lines2)
+                success = (proc2.returncode or 0) == 0 and \
+                          "fail" not in stdout2.lower() and \
+                          "there is no" not in stdout2.lower()
+                res = {"returncode": proc2.returncode or 0, "stdout": stdout2, "stderr": ""}
+
         if success:
             await ws_manager.broadcast({
                 "type": "tizenbrew_install_progress", "tv_id": tv_id,
@@ -939,7 +1076,28 @@ class TizenBrewService:
                 "message": f"Fetching {app_def['name']}…",
             })
 
-            if app_def["source_type"] == "github":
+            if app_def["source_type"] == "local_build":
+                # Route to the dedicated local build+install pipeline which uses the
+                # locally-built WGT from RADARRZEN_SRC_PATH / SONARRZEN_SRC_PATH etc.
+                # This ensures the installed version matches what was built locally,
+                # NOT whatever old .wgt might be committed to a remote GitHub repo.
+                src = app_def.get("source", "")
+                if src == "local:radarrzen" or app_def.get("id") == "radarr":
+                    await self.build_and_install_radarrzen(tv_id)
+                elif src == "local:sonarrzen" or app_def.get("id") == "sonarr":
+                    await self.build_and_install_sonarrzen(tv_id)
+                elif src == "local:fieshzen" or app_def.get("id") == "fieshzen":
+                    await self.build_and_install_fieshzen(tv_id)
+                elif src == "local:castafiorezen" or app_def.get("id") == "castafiorezen":
+                    await self.build_and_install_castafiorezen(tv_id)
+                else:
+                    await ws_manager.broadcast({
+                        "type": "tizenbrew_install_progress", "tv_id": tv_id,
+                        "step": "error", "progress": 0,
+                        "message": f"No local build pipeline configured for source '{src}'.",
+                    })
+                return  # dedicated pipeline handles its own completion broadcasts
+            elif app_def["source_type"] == "github":
                 fetched = await self.fetch_github_wgt(app_def["source"], tv_id=tv_id)
             elif app_def["source_type"] in ("wgt_url", "url"):
                 fetched = await self.fetch_url_wgt(app_def["source"])
@@ -999,13 +1157,17 @@ class TizenBrewService:
 
     # ── Radarrzen local build + install ────────────────────────────────────
     async def build_and_install_radarrzen(self, tv_id: int) -> None:
-        """Build Radarrzen WGT from local source, inject config, sign if needed, install."""
+        """Build Radarrzen WGT from local source, inject config BEFORE signing, install."""
+        import json as _json
+        import tempfile
+
         async def _broadcast(msg: str, pct: int, step: str = "building") -> None:
             await ws_manager.broadcast({
                 "type": "tizenbrew_install_progress",
                 "tv_id": tv_id, "step": step, "progress": pct, "message": msg,
             })
 
+        tmp_src: Path | None = None
         try:
             src_path = getattr(settings, "RADARRZEN_SRC_PATH", "") or ""
             profile_name = getattr(settings, "RADARRZEN_TIZEN_PROFILE", "SAWSUBE") or "SAWSUBE"
@@ -1032,25 +1194,70 @@ class TizenBrewService:
                 await _broadcast("TV not found in DB.", 0, "error")
                 return
 
-            # Step 1: Package WGT from source
-            await _broadcast(f"Packaging WGT from {src_path} (profile: {profile_name})…", 10)
-            out_dir_path = self.download_dir / "radarrzen_build"
+            # Step 1: Copy source to a temp dir and inject config BEFORE signing.
+            # This avoids the sign→modify→resign cycle that causes certificate errors.
+            await _broadcast("Injecting Radarr config into source…", 8, "injecting")
+            tmp_src = Path(tempfile.mkdtemp(prefix="sawsube_rz_"))
+            shutil.copytree(src_path, str(tmp_src), dirs_exist_ok=True)
+
+            # Remove any existing signature files so tizen package generates clean ones
+            for sig_file in ("author-signature.xml", "signature1.xml", ".manifest.tmp"):
+                (tmp_src / sig_file).unlink(missing_ok=True)
+
+            cfg_js_path = tmp_src / "js" / "sawsube-config.js"
+            original = cfg_js_path.read_text(encoding="utf-8") if cfg_js_path.is_file() else \
+                "var TMDB_API_KEY = '__TMDB_API_KEY__';\n(function(){})();\n"
+
+            # Inject TMDB API key
+            tmdb_key = getattr(settings, "TMDB_API_KEY", "") or ""
+            if tmdb_key:
+                original = original.replace("'__TMDB_API_KEY__'", _json.dumps(tmdb_key))
+                original = original.replace('"__TMDB_API_KEY__"', _json.dumps(tmdb_key))
+
+            # Inject Radarr credentials as a localStorage pre-seed
+            radarr_app_def = next((a for a in CURATED_APPS if a.get("id") == "radarr"), None)
+            if radarr_app_def:
+                inject_cfg = radarr_app_def.get("inject_config", {})
+                radarr_config = {}
+                for js_key, settings_attr in inject_cfg.get("fields", {}).items():
+                    val = getattr(settings, settings_attr, "") or ""
+                    if val:
+                        radarr_config[js_key] = val
+                if radarr_config:
+                    storage_key = inject_cfg["storage_key"]
+                    seed_js = (
+                        f"(function(){{var k={_json.dumps(storage_key)};"
+                        f"try{{if(!localStorage.getItem(k))"
+                        f"{{localStorage.setItem(k,JSON.stringify({_json.dumps(radarr_config)}));}}"
+                        f"}}catch(e){{}}}})();"
+                    )
+                    original = original.replace("(function(){})();", seed_js)
+                    preview = {k: (v[:8] + "…" if k == "apiKey" and len(v) > 8 else v)
+                               for k, v in radarr_config.items()}
+                    await _broadcast(f"Injecting config into WGT: {preview}", 12, "injecting")
+
+            cfg_js_path.write_text(original, encoding="utf-8")
+
+            # Step 2: Package WGT from the prepared temp source (signs in one step)
+            await _broadcast(f"Packaging WGT from {src_path} (profile: {profile_name})…", 15)
+            out_dir_path = (self.download_dir / "radarrzen_build").resolve()
             out_dir = str(out_dir_path)
-            # Clean old build artifacts so glob can't pick up stale _cfg_*.wgt files
             if out_dir_path.exists():
                 for old in out_dir_path.glob("*.wgt"):
                     old.unlink(missing_ok=True)
             out_dir_path.mkdir(parents=True, exist_ok=True)
 
-            # tizen package --type wgt --sign <profile> -o <out_dir> -- <src_dir>
+            log.info("radarrzen_build: running tizen package (profile=%s, out=%s, tmp_src=%s)", profile_name, out_dir, tmp_src)
             pkg_res = await self.run_command(
                 [tools["tizen_path"], "package",
                  "--type", "wgt",
                  "--sign", profile_name,
                  "-o", out_dir,
-                 "--", src_path],
+                 "--", str(tmp_src)],
                 timeout=120.0, tv_id=tv_id, step="building", progress=20,
             )
+            log.info("radarrzen_build: tizen package returncode=%s stdout=%r",
+                     pkg_res["returncode"], pkg_res.get("stdout", "")[-300:])
             if pkg_res["returncode"] != 0:
                 await _broadcast(
                     f"Build failed (exit {pkg_res['returncode']}): "
@@ -1059,44 +1266,26 @@ class TizenBrewService:
                 )
                 return
 
-            # Find the produced WGT
-            wgt_files = list(Path(out_dir).glob("*.wgt"))
+            # Find the produced WGT — parse stdout for authoritative location
+            wgt_files = list(out_dir_path.glob("*.wgt"))
             if not wgt_files:
-                # Also check if tizen placed it inside the src dir
-                wgt_files = list(Path(src_path).glob("*.wgt"))
-                if wgt_files:
-                    target = self.download_dir / "radarrzen_build" / wgt_files[0].name
-                    shutil.move(str(wgt_files[0]), target)
-                    wgt_files = [target]
+                for line in pkg_res.get("stdout", "").splitlines():
+                    if "Package File Location:" in line:
+                        located = line.split("Package File Location:")[-1].strip()
+                        if Path(located).exists():
+                            target = out_dir_path / Path(located).name
+                            shutil.move(located, target)
+                            wgt_files = [target]
+                            break
             if not wgt_files:
+                log.error("radarrzen_build: no .wgt produced in %s", out_dir)
                 await _broadcast("Build produced no .wgt file — check your Tizen profile and src path.", 0, "error")
                 return
 
             wgt_path = str(wgt_files[0])
             await _broadcast(f"Built: {Path(wgt_path).name}", 40)
 
-            # Step 2: Inject Radarr credentials from settings
-            radarr_app_def = next(
-                (a for a in CURATED_APPS if a.get("id") == "radarr"), None
-            )
-            if radarr_app_def:
-                wgt_path = await self.inject_app_config(radarr_app_def, wgt_path, tv_id=tv_id)
-                await _broadcast("Config injected.", 55)
-
-            # Step 3: Re-sign if TV requires cert (Tizen 7+)
-            info = await self.fetch_tv_api_info(tv.ip)
-            if info.get("requires_certificate"):
-                await _broadcast("Tizen 7+ TV — re-signing with certificate…", 60, "resigning")
-                rs = await self.resign_wgt(
-                    tools["tizen_path"], wgt_path, profile_name,
-                    str(self.download_dir / "radarrzen_build" / "signed"), tv_id=tv_id,
-                )
-                if rs.get("error"):
-                    await _broadcast(f"Re-sign failed: {rs['error']}", 0, "error")
-                    return
-                wgt_path = rs["resigned_path"] or wgt_path
-
-            # Step 4: Install
+            # Step 3: Install (no resign needed — signed correctly in step 2)
             res = await self.install_wgt(tools["sdb_path"], tools["tizen_path"], tv.ip, wgt_path, tv_id)
             if res["success"]:
                 await self.update_state(tv_id, sdb_connected=True, notes=None)
@@ -1118,16 +1307,23 @@ class TizenBrewService:
                 "type": "tizenbrew_install_progress", "tv_id": tv_id,
                 "step": "error", "progress": 0, "message": f"Build error: {e}",
             })
+        finally:
+            if tmp_src and tmp_src.exists():
+                shutil.rmtree(tmp_src, ignore_errors=True)
 
     # ── Sonarrzen local build + install ────────────────────────────────────
     async def build_and_install_sonarrzen(self, tv_id: int) -> None:
-        """Build Sonarrzen WGT from local source, inject config, sign if needed, install."""
+        """Build Sonarrzen WGT from local source, inject config BEFORE signing, install."""
+        import json as _json
+        import tempfile
+
         async def _broadcast(msg: str, pct: int, step: str = "building") -> None:
             await ws_manager.broadcast({
                 "type": "tizenbrew_install_progress",
                 "tv_id": tv_id, "step": step, "progress": pct, "message": msg,
             })
 
+        tmp_src: Path | None = None
         try:
             src_path = getattr(settings, "SONARRZEN_SRC_PATH", "") or ""
             profile_name = getattr(settings, "SONARRZEN_TIZEN_PROFILE", "SAWSUBE") or "SAWSUBE"
@@ -1154,22 +1350,67 @@ class TizenBrewService:
                 await _broadcast("TV not found in DB.", 0, "error")
                 return
 
-            await _broadcast(f"Packaging WGT from {src_path} (profile: {profile_name})…", 10)
-            out_dir_path = self.download_dir / "sonarrzen_build"
+            # Step 1: Copy source to temp dir and inject config BEFORE signing
+            await _broadcast("Injecting Sonarr config into source…", 8, "injecting")
+            tmp_src = Path(tempfile.mkdtemp(prefix="sawsube_sz_"))
+            shutil.copytree(src_path, str(tmp_src), dirs_exist_ok=True)
+
+            # Remove any existing signature files so tizen package generates clean ones
+            for sig_file in ("author-signature.xml", "signature1.xml", ".manifest.tmp"):
+                (tmp_src / sig_file).unlink(missing_ok=True)
+
+            cfg_js_path = tmp_src / "js" / "sawsube-config.js"
+            original = cfg_js_path.read_text(encoding="utf-8") if cfg_js_path.is_file() else \
+                "var TMDB_API_KEY = '__TMDB_API_KEY__';\n(function(){})();\n"
+
+            tmdb_key = getattr(settings, "TMDB_API_KEY", "") or ""
+            if tmdb_key:
+                original = original.replace("'__TMDB_API_KEY__'", _json.dumps(tmdb_key))
+                original = original.replace('"__TMDB_API_KEY__"', _json.dumps(tmdb_key))
+
+            sonarr_app_def = next((a for a in CURATED_APPS if a.get("id") == "sonarr"), None)
+            if sonarr_app_def:
+                inject_cfg = sonarr_app_def.get("inject_config", {})
+                sonarr_config = {}
+                for js_key, settings_attr in inject_cfg.get("fields", {}).items():
+                    val = getattr(settings, settings_attr, "") or ""
+                    if val:
+                        sonarr_config[js_key] = val
+                if sonarr_config:
+                    storage_key = inject_cfg["storage_key"]
+                    seed_js = (
+                        f"(function(){{var k={_json.dumps(storage_key)};"
+                        f"try{{if(!localStorage.getItem(k))"
+                        f"{{localStorage.setItem(k,JSON.stringify({_json.dumps(sonarr_config)}));}}"
+                        f"}}catch(e){{}}}})();"
+                    )
+                    original = original.replace("(function(){})();", seed_js)
+                    preview = {k: (v[:8] + "…" if k == "apiKey" and len(v) > 8 else v)
+                               for k, v in sonarr_config.items()}
+                    await _broadcast(f"Injecting config into WGT: {preview}", 12, "injecting")
+
+            cfg_js_path.write_text(original, encoding="utf-8")
+
+            # Step 2: Package WGT from the prepared temp source (signs in one step)
+            await _broadcast(f"Packaging WGT from {src_path} (profile: {profile_name})…", 15)
+            out_dir_path = (self.download_dir / "sonarrzen_build").resolve()
             out_dir = str(out_dir_path)
             if out_dir_path.exists():
                 for old in out_dir_path.glob("*.wgt"):
                     old.unlink(missing_ok=True)
             out_dir_path.mkdir(parents=True, exist_ok=True)
 
+            log.info("sonarrzen_build: running tizen package (profile=%s, out=%s, tmp_src=%s)", profile_name, out_dir, tmp_src)
             pkg_res = await self.run_command(
                 [tools["tizen_path"], "package",
                  "--type", "wgt",
                  "--sign", profile_name,
                  "-o", out_dir,
-                 "--", src_path],
+                 "--", str(tmp_src)],
                 timeout=120.0, tv_id=tv_id, step="building", progress=20,
             )
+            log.info("sonarrzen_build: tizen package returncode=%s stdout=%r",
+                     pkg_res["returncode"], pkg_res.get("stdout", "")[-300:])
             if pkg_res["returncode"] != 0:
                 await _broadcast(
                     f"Build failed (exit {pkg_res['returncode']}): "
@@ -1178,39 +1419,25 @@ class TizenBrewService:
                 )
                 return
 
-            wgt_files = list(Path(out_dir).glob("*.wgt"))
+            wgt_files = list(out_dir_path.glob("*.wgt"))
             if not wgt_files:
-                wgt_files = list(Path(src_path).glob("*.wgt"))
-                if wgt_files:
-                    target = self.download_dir / "sonarrzen_build" / wgt_files[0].name
-                    shutil.move(str(wgt_files[0]), target)
-                    wgt_files = [target]
+                for line in pkg_res.get("stdout", "").splitlines():
+                    if "Package File Location:" in line:
+                        located = line.split("Package File Location:")[-1].strip()
+                        if Path(located).exists():
+                            target = out_dir_path / Path(located).name
+                            shutil.move(located, target)
+                            wgt_files = [target]
+                            break
             if not wgt_files:
+                log.error("sonarrzen_build: no .wgt produced in %s", out_dir)
                 await _broadcast("Build produced no .wgt file — check your Tizen profile and src path.", 0, "error")
                 return
 
             wgt_path = str(wgt_files[0])
             await _broadcast(f"Built: {Path(wgt_path).name}", 40)
 
-            sonarr_app_def = next(
-                (a for a in CURATED_APPS if a.get("id") == "sonarr"), None
-            )
-            if sonarr_app_def:
-                wgt_path = await self.inject_app_config(sonarr_app_def, wgt_path, tv_id=tv_id)
-                await _broadcast("Config injected.", 55)
-
-            info = await self.fetch_tv_api_info(tv.ip)
-            if info.get("requires_certificate"):
-                await _broadcast("Tizen 7+ TV — re-signing with certificate…", 60, "resigning")
-                rs = await self.resign_wgt(
-                    tools["tizen_path"], wgt_path, profile_name,
-                    str(self.download_dir / "sonarrzen_build" / "signed"), tv_id=tv_id,
-                )
-                if rs.get("error"):
-                    await _broadcast(f"Re-sign failed: {rs['error']}", 0, "error")
-                    return
-                wgt_path = rs["resigned_path"] or wgt_path
-
+            # Step 3: Install directly (no resign needed — signed correctly in step 2)
             res = await self.install_wgt(tools["sdb_path"], tools["tizen_path"], tv.ip, wgt_path, tv_id)
             if res["success"]:
                 await self.update_state(tv_id, sdb_connected=True, notes=None)
@@ -1232,6 +1459,9 @@ class TizenBrewService:
                 "type": "tizenbrew_install_progress", "tv_id": tv_id,
                 "step": "error", "progress": 0, "message": f"Build error: {e}",
             })
+        finally:
+            if tmp_src and tmp_src.exists():
+                shutil.rmtree(tmp_src, ignore_errors=True)
 
     # ── Fieshzen local build + install ────────────────────────────────────────
     async def build_and_install_fieshzen(self, tv_id: int) -> None:
@@ -1512,6 +1742,153 @@ class TizenBrewService:
 
         except Exception as e:
             log.exception("build_and_install_fieshzen crashed")
+            await ws_manager.broadcast({
+                "type": "tizenbrew_install_progress", "tv_id": tv_id,
+                "step": "error", "progress": 0, "message": f"Build error: {e}",
+            })
+
+    # ── Castafiorezen local build + install ──────────────────────────────────
+    async def build_and_install_castafiorezen(self, tv_id: int) -> None:
+        """Build Castafiorezen WGT from local src/ folder, inject Navidrome
+        credentials into js/sawsube-config.js, sign, and install onto the TV."""
+        import tempfile
+
+        async def _broadcast(msg: str, pct: int, step: str = "building") -> None:
+            await ws_manager.broadcast({
+                "type": "tizenbrew_install_progress",
+                "tv_id": tv_id, "step": step, "progress": pct, "message": msg,
+            })
+
+        try:
+            cz_src = getattr(settings, "CASTAFIOREZEN_SRC_PATH", "") or ""
+            profile_name = (
+                getattr(settings, "CASTAFIOREZEN_TIZEN_PROFILE", "SAWSUBE") or "SAWSUBE"
+            )
+            nd_url = getattr(settings, "NAVIDROME_URL", "") or ""
+            nd_user = getattr(settings, "NAVIDROME_USERNAME", "") or ""
+            nd_pass = getattr(settings, "NAVIDROME_PASSWORD", "") or ""
+
+            if not cz_src or not Path(cz_src).is_dir():
+                await _broadcast(
+                    f"CASTAFIOREZEN_SRC_PATH not set or not found ('{cz_src}'). "
+                    "Set it in .env to point at the Castafiorezen repo directory.",
+                    0, "error",
+                )
+                return
+            cz_src_dir = Path(cz_src) / "src"
+            if not cz_src_dir.is_dir():
+                await _broadcast(
+                    f"Castafiorezen src/ folder not found at {cz_src_dir}", 0, "error",
+                )
+                return
+            if not (nd_url and nd_user and nd_pass):
+                await _broadcast(
+                    "NAVIDROME_URL/USERNAME/PASSWORD not set — required for Castafiorezen.",
+                    0, "error",
+                )
+                return
+
+            tools = await self.find_tizen_tools()
+            if not tools["tizen_path"]:
+                await _broadcast("Tizen Studio CLI not found.", 0, "error")
+                return
+            if not tools["sdb_path"]:
+                await _broadcast("sdb not found.", 0, "error")
+                return
+
+            async with SessionLocal() as s:
+                tv = await s.get(TV, tv_id)
+            if not tv:
+                await _broadcast("TV not found in DB.", 0, "error")
+                return
+
+            await _broadcast("Assembling Castafiorezen WGT directory…", 20)
+            tmp_dir = Path(tempfile.mkdtemp(prefix="castafiorezen_wgt_"))
+            try:
+                shutil.copytree(str(cz_src_dir), str(tmp_dir), dirs_exist_ok=True)
+
+                # Inject credentials into sawsube-config.js
+                cfg = {
+                    "serverUrl": nd_url,
+                    "username": nd_user,
+                    "password": nd_pass,
+                }
+                cfg_js = (
+                    "(function(){var k='cz-server';try{"
+                    "if(!localStorage.getItem(k)){"
+                    f"localStorage.setItem(k,JSON.stringify({json.dumps(cfg)}));"
+                    "}}catch(e){}})();\n"
+                )
+                cfg_path = tmp_dir / "js" / "sawsube-config.js"
+                cfg_path.parent.mkdir(parents=True, exist_ok=True)
+                cfg_path.write_text(cfg_js, encoding="utf-8")
+                await _broadcast("Injected Navidrome credentials.", 35)
+
+                await _broadcast(f"Packaging WGT (profile: {profile_name})…", 50)
+                out_dir_path = self.download_dir / "castafiorezen_build"
+                out_dir_path.mkdir(parents=True, exist_ok=True)
+                for old in out_dir_path.glob("*.wgt"):
+                    old.unlink(missing_ok=True)
+
+                pkg_res = await self.run_command(
+                    [tools["tizen_path"], "package",
+                     "--type", "wgt",
+                     "--sign", profile_name,
+                     "-o", str(out_dir_path),
+                     "--", str(tmp_dir)],
+                    timeout=300.0, tv_id=tv_id, step="building", progress=60,
+                )
+                if pkg_res["returncode"] != 0:
+                    await _broadcast(
+                        f"WGT packaging failed: {pkg_res.get('stderr') or pkg_res['stdout'][-400:]}",
+                        0, "error",
+                    )
+                    return
+
+                wgt_files = list(out_dir_path.glob("*.wgt"))
+                if not wgt_files:
+                    await _broadcast("No .wgt file produced — check Tizen profile.", 0, "error")
+                    return
+                wgt_path = str(wgt_files[0])
+                await _broadcast(f"Built: {Path(wgt_path).name}", 70)
+
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            # Re-sign if TV requires it
+            info = await self.fetch_tv_api_info(tv.ip)
+            if info.get("requires_certificate"):
+                state = await self.get_or_create_state(tv_id)
+                if state.certificate_profile:
+                    await _broadcast("Re-signing for Tizen 7+ TV…", 75, "resigning")
+                    rs = await self.resign_wgt(
+                        tools["tizen_path"], wgt_path, state.certificate_profile,
+                        str(self.download_dir / "castafiorezen_build" / "signed"), tv_id=tv_id,
+                    )
+                    if rs.get("error"):
+                        await _broadcast(f"Re-sign failed: {rs['error']}", 0, "error")
+                        return
+                    wgt_path = rs["resigned_path"] or wgt_path
+
+            res = await self.install_wgt(
+                tools["sdb_path"], tools["tizen_path"], tv.ip, wgt_path, tv_id,
+            )
+            if res["success"]:
+                await self.update_state(tv_id, sdb_connected=True, notes=None)
+                async with SessionLocal() as s:
+                    s.add(TizenBrewInstalledApp(
+                        tv_id=tv_id,
+                        app_name="Castafiorezen",
+                        app_source="local:castafiorezen",
+                        wgt_path=wgt_path,
+                        version="local-build",
+                    ))
+                    await s.commit()
+            else:
+                await self.update_state(tv_id, notes=res.get("error") or "install failed")
+
+        except Exception as e:
+            log.exception("build_and_install_castafiorezen crashed")
             await ws_manager.broadcast({
                 "type": "tizenbrew_install_progress", "tv_id": tv_id,
                 "step": "error", "progress": 0, "message": f"Build error: {e}",

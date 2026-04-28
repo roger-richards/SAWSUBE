@@ -11,6 +11,7 @@ import Sources from './pages/Sources'
 import Schedules from './pages/Schedules'
 import Settings from './pages/Settings'
 import TizenBrew from './pages/TizenBrew'
+import Debloat from './pages/Debloat'
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -49,6 +50,7 @@ export default function App() {
               <Route path="/schedules" element={<Schedules />} />
               <Route path="/settings" element={<Settings />} />
               <Route path="/tizenbrew" element={<TizenBrew />} />
+              <Route path="/debloat" element={<Debloat />} />
             </Routes>
           </main>
         </div>

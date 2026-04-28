@@ -4,6 +4,7 @@ import os
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from ..config import settings
 from ..database import get_session
 from ..models.folder import WatchFolder
 from ..schemas import FolderCreate, FolderOut, ImportPayload, ImageOut
@@ -57,6 +58,8 @@ async def scan(fid: int, s: AsyncSession = Depends(get_session)):
 # ── Unsplash ───────────────────────────────────────────────────────────────
 @router.get("/unsplash/search")
 async def unsplash_search(q: str = Query(...), per_page: int = 20):
+    if not settings.UNSPLASH_API_KEY:
+        raise HTTPException(503, "UNSPLASH_API_KEY not configured — add it to .env")
     return await unsplash.search(q, per_page)
 
 
@@ -102,6 +105,8 @@ async def nasa_import():
 # ── Rijksmuseum ────────────────────────────────────────────────────────────
 @router.get("/rijksmuseum/search")
 async def rijks_search(q: str = Query(...), per_page: int = 20):
+    if not settings.RIJKSMUSEUM_API_KEY:
+        raise HTTPException(503, "RIJKSMUSEUM_API_KEY not configured — add it to .env")
     return await rijksmuseum.search(q, per_page)
 
 
@@ -124,6 +129,8 @@ async def rijks_import(payload: ImportPayload):
 # ── Pexels ────────────────────────────────────────────────────────────────
 @router.get("/pexels/search")
 async def pexels_search(q: str = Query(...), per_page: int = 20):
+    if not settings.PEXELS_API_KEY:
+        raise HTTPException(503, "PEXELS_API_KEY not configured — add it to .env")
     return await pexels.search(q, per_page)
 
 
@@ -147,6 +154,8 @@ async def pexels_import(payload: ImportPayload):
 # ── Pixabay ──────────────────────────────────────────────────────────────
 @router.get("/pixabay/search")
 async def pixabay_search(q: str = Query(...), per_page: int = 20):
+    if not settings.PIXABAY_API_KEY:
+        raise HTTPException(503, "PIXABAY_API_KEY not configured — add it to .env")
     return await pixabay.search(q, per_page)
 
 
