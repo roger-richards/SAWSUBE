@@ -15,9 +15,9 @@ COPY frontend/package-lock.json ./frontend/package-lock.json
 
 # Use npm ci when lockfile exists, otherwise fall back to npm install
 RUN if [ -f ./frontend/package-lock.json ]; then \
-      npm ci --silent --no-audit --progress=false; \
+      npm ci --no-audit --progress=false; \
     else \
-      npm install --silent --no-audit --progress=false; \
+      npm install --no-audit --progress=false; \
     fi
 
 COPY frontend/ .
