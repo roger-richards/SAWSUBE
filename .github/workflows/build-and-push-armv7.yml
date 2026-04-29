@@ -67,8 +67,8 @@ jobs:
           platforms: linux/arm/v7
           push: true
           tags: |
-            yourdockerhubuser/sawsub8:${{ steps.tags.outputs.tag }}
-            yourdockerhubuser/sawsub8:${{ steps.tags.outputs.latest_tag }}
+            rogerrichards/sawsub8:${{ steps.tags.outputs.tag }}
+            rogerrichards/sawsub8:${{ steps.tags.outputs.latest_tag }}
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
           build-args: |
