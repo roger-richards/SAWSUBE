@@ -50,7 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /usr/local/lib/python3.11 /usr/local/lib/python3.11
 COPY --from=build /usr/local/bin /usr/local/bin
-COPY --from=build /app ./app
+COPY --from=build /app /app
 
 ENV PYTHONUNBUFFERED=1
 ENV FRONTEND_DIST=/app/frontend/dist
