@@ -7,5 +7,5 @@
   with:
 	context: .
 	push: true
-	tags: yourdockerhubuser/yourrepo:latest
+	tags: rogerrichards/sawsub8:latest
 	platforms: linux/arm/v7
